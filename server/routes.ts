@@ -201,29 +201,45 @@ async function fetchTranscript(videoId: number, loomId: string) {
       (video as any).thumbnailUrl = thumbnailUrl;
     }
 
-    if (transcript && transcript.length > 50) {
-      await processTranscriptChunks(videoId, transcript);
-      storage.updateVideoStatus(videoId, "ready", transcript);
-    } else if (loomTranscriptionFailed || !transcript) {
-      // Fallback: download audio and transcribe with Whisper
-      console.log(`[Fallback] Attempting audio transcription for video ${loomId}...`);
-      storage.updateVideoStatus(videoId, "processing", undefined, "Loom transcript unavailable. Downloading audio for AI transcription...");
-      try {
-        const fallbackTranscript = await downloadAndTranscribe(loomId);
-        if (fallbackTranscript && fallbackTranscript.length > 5) {
-          await processTranscriptChunks(videoId, fallbackTranscript);
-          storage.updateVideoStatus(videoId, "ready", fallbackTranscript);
-          console.log(`[Fallback] Successfully transcribed video ${loomId} (${fallbackTranscript.length} chars)`);
-        } else {
-          storage.updateVideoStatus(videoId, "error", undefined, "Audio transcription returned insufficient text. The video may have no speech. Paste the transcript manually.");
+    // If no Loom transcript, try audio fallback
+    if (!transcript || transcript.length <= 50) {
+      if (loomTranscriptionFailed || !transcript) {
+        console.log(`[Fallback] Attempting audio transcription for video ${loomId}...`);
+        storage.updateVideoStatus(videoId, "processing", undefined, "Loom transcript unavailable. Downloading audio for AI transcription...");
+        try {
+          const fallbackTranscript = await downloadAndTranscribe(loomId);
+          if (fallbackTranscript && fallbackTranscript.length > 5) {
+            transcript = fallbackTranscript;
+            console.log(`[Fallback] Audio transcribed for ${loomId} (${transcript.length} chars)`);
+          }
+        } catch (fallbackErr: any) {
+          console.error(`[Fallback] Audio transcription failed for ${loomId}:`, fallbackErr.message);
         }
-      } catch (fallbackErr: any) {
-        console.error(`[Fallback] Transcription failed for ${loomId}:`, fallbackErr.message);
-        const errorMsg = loomTranscriptionFailed
-          ? `Loom has no transcript for this video. Auto-transcription also failed: ${fallbackErr.message}. Paste the transcript manually.`
-          : `Could not auto-fetch transcript. Auto-transcription failed: ${fallbackErr.message}. Paste the transcript manually.`;
-        storage.updateVideoStatus(videoId, "error", undefined, errorMsg);
       }
+    }
+
+    // Extract visual context (screen content) for every video
+    let visualContext: string | null = null;
+    try {
+      storage.updateVideoStatus(videoId, "processing", transcript || undefined, "Analyzing video screen content...");
+      visualContext = await extractVisualContext(loomId);
+    } catch (visErr: any) {
+      console.error(`[Visual] Failed for ${loomId}:`, visErr.message);
+      // Visual context is optional — we can still proceed with transcript only
+    }
+
+    // Build combined context from transcript + visual descriptions
+    const fullContext = buildFullContext(transcript, visualContext);
+
+    if (fullContext && fullContext.length > 20) {
+      await processTranscriptChunks(videoId, fullContext);
+      storage.updateVideoStatus(videoId, "ready", transcript || "", undefined, visualContext || undefined);
+      console.log(`[Done] Video ${loomId}: transcript=${(transcript || "").length}ch, visual=${(visualContext || "").length}ch, combined=${fullContext.length}ch`);
+    } else {
+      const errorMsg = loomTranscriptionFailed
+        ? "Loom has no transcript and visual analysis returned nothing. Paste the transcript manually."
+        : "Could not extract content from this video. Paste the transcript manually.";
+      storage.updateVideoStatus(videoId, "error", undefined, errorMsg);
     }
   } catch (err: any) {
     storage.updateVideoStatus(videoId, "error", undefined, err.message || "Failed to fetch transcript");
@@ -348,6 +364,152 @@ async function downloadAndTranscribe(loomId: string): Promise<string> {
   }
 }
 
+/**
+ * Downloads video from Loom and extracts key frames, then uses Claude Vision
+ * to describe what's shown on screen. Returns a text description of the visual content.
+ */
+async function extractVisualContext(loomId: string): Promise<string> {
+  const tempDir = await mkdtemp(join(tmpdir(), "davebot-vis-"));
+  const videoPath = join(tempDir, `${loomId}.mp4`);
+  const framesDir = join(tempDir, "frames");
+
+  try {
+    await execAsync(`mkdir -p "${framesDir}"`);
+
+    // Download video via yt-dlp (lowest quality to save bandwidth — we just need frames)
+    let downloadOk = false;
+    try {
+      await execAsync(
+        `yt-dlp -f "worst[ext=mp4]/worst" --no-audio -o "${videoPath}" "https://www.loom.com/share/${loomId}"`,
+        { timeout: 120000 }
+      );
+      downloadOk = true;
+    } catch {
+      // Fallback: download with audio included, any quality
+      try {
+        await execAsync(
+          `yt-dlp -f "worst" -o "${videoPath}" "https://www.loom.com/share/${loomId}"`,
+          { timeout: 120000 }
+        );
+        downloadOk = true;
+      } catch {
+        // Try ffmpeg + Loom API
+        try {
+          const rawUrlResp = await fetch(
+            `https://www.loom.com/api/campaigns/sessions/${loomId}/raw-url`,
+            {
+              method: "POST",
+              headers: { Accept: "application/json", "Content-Type": "application/json" },
+              body: JSON.stringify({ anonID: crypto.randomUUID(), deviceID: null, force_original: false, password: null }),
+            }
+          );
+          if (rawUrlResp.ok) {
+            const data = await rawUrlResp.json() as any;
+            const hlsUrl = data?.url?.replace('-split.m3u8', '.m3u8');
+            if (hlsUrl) {
+              await execAsync(`ffmpeg -i "${hlsUrl}" -c copy -y "${videoPath}"`, { timeout: 120000 });
+              downloadOk = true;
+            }
+          }
+        } catch {}
+      }
+    }
+
+    if (!downloadOk) {
+      throw new Error("Could not download video for visual analysis");
+    }
+
+    // Get video duration
+    let duration = 30; // default assumption
+    try {
+      const { stdout: durStr } = await execAsync(
+        `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`,
+        { timeout: 15000 }
+      );
+      duration = Math.ceil(parseFloat(durStr.trim()) || 30);
+    } catch {}
+
+    // Extract frames: 1 frame every 10 seconds, max 20 frames
+    const interval = Math.max(10, Math.ceil(duration / 20));
+    await execAsync(
+      `ffmpeg -i "${videoPath}" -vf "fps=1/${interval},scale=1280:-2" -q:v 3 "${framesDir}/frame_%04d.jpg"`,
+      { timeout: 60000 }
+    );
+
+    // Read frame files
+    const { stdout: frameList } = await execAsync(`ls -1 "${framesDir}"/*.jpg 2>/dev/null || true`);
+    const framePaths = frameList.trim().split("\n").filter(Boolean).slice(0, 20);
+
+    if (framePaths.length === 0) {
+      throw new Error("No frames extracted from video");
+    }
+
+    console.log(`[Visual] Extracted ${framePaths.length} frames from ${loomId} (${duration}s video, interval=${interval}s)`);
+
+    // Build Claude Vision request with all frames
+    const imageBlocks: Array<{ type: "image"; source: { type: "base64"; media_type: string; data: string } }> = [];
+    for (const fp of framePaths) {
+      const imgData = await readFile(fp);
+      imageBlocks.push({
+        type: "image",
+        source: { type: "base64", media_type: "image/jpeg", data: imgData.toString("base64") },
+      });
+    }
+
+    // Send all frames to Claude Vision in one request for comprehensive analysis
+    const response = await anthropic.messages.create({
+      model: "claude_sonnet_4_6",
+      max_tokens: 4096,
+      messages: [
+        {
+          role: "user",
+          content: [
+            ...imageBlocks,
+            {
+              type: "text",
+              text: `These are ${framePaths.length} screenshots taken at regular intervals from a Loom screen recording video. Analyze ALL frames and provide a comprehensive description of what is shown in this video. Include:
+
+1. **What app/website/tool** is being shown (identify specific software, websites, dashboards, etc.)
+2. **What actions** are being performed step by step (clicks, typing, navigating, configuring, etc.)
+3. **Any text visible on screen** — menus, labels, data, form fields, error messages, URLs, settings, values
+4. **The overall purpose** — what process/workflow/task is being demonstrated
+5. **Key information** — any numbers, names, dates, settings, or configurations visible
+
+Be thorough and specific. This description will be used as a knowledge base, so capture every meaningful detail that someone might later search for.`,
+            },
+          ],
+        },
+      ],
+    });
+
+    const visualDescription = response.content[0].type === "text" ? response.content[0].text : "";
+    console.log(`[Visual] Generated visual context for ${loomId} (${visualDescription.length} chars)`);
+    return visualDescription;
+  } finally {
+    try {
+      await execAsync(`rm -rf "${tempDir}"`).catch(() => {});
+    } catch {}
+  }
+}
+
+/**
+ * Combines audio transcript and visual context into a single rich context document
+ * that captures both what was said and what was shown on screen.
+ */
+function buildFullContext(transcript: string | null, visualContext: string | null): string {
+  const parts: string[] = [];
+
+  if (transcript && transcript.length > 5 && transcript !== "[singing]") {
+    parts.push(`=== AUDIO TRANSCRIPT ===\n${transcript}`);
+  }
+
+  if (visualContext && visualContext.length > 20) {
+    parts.push(`=== VISUAL CONTEXT (what is shown on screen) ===\n${visualContext}`);
+  }
+
+  return parts.join("\n\n") || transcript || "";
+}
+
 export async function registerRoutes(
   httpServer: Server,
   app: Express
@@ -376,6 +538,7 @@ export async function registerRoutes(
       loomUrl: url,
       loomId,
       transcript: null,
+      visualContext: null,
       duration: null,
       thumbnailUrl: null,
       status: "pending",
@@ -418,6 +581,7 @@ export async function registerRoutes(
         loomUrl: url,
         loomId,
         transcript: null,
+        visualContext: null,
         duration: null,
         thumbnailUrl: null,
         status: "pending",
@@ -796,6 +960,7 @@ export async function registerRoutes(
       loomUrl: url,
       loomId,
       transcript: null,
+      visualContext: null,
       duration: null,
       thumbnailUrl: null,
       status: "pending",

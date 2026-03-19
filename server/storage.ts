@@ -10,7 +10,7 @@ export interface IStorage {
   getVideo(id: number): Video | undefined;
   getVideoByLoomId(loomId: string): Video | undefined;
   getAllVideos(): Video[];
-  updateVideoStatus(id: number, status: string, transcript?: string, errorMessage?: string): Video | undefined;
+  updateVideoStatus(id: number, status: string, transcript?: string, errorMessage?: string, visualContext?: string): Video | undefined;
   deleteVideo(id: number): void;
   addChunk(chunk: InsertChunk): Chunk;
   getChunksByVideoId(videoId: number): Chunk[];
@@ -61,7 +61,7 @@ export class MemStorage implements IStorage {
     });
   }
 
-  updateVideoStatus(id: number, status: string, transcript?: string, errorMessage?: string): Video | undefined {
+  updateVideoStatus(id: number, status: string, transcript?: string, errorMessage?: string, visualContext?: string): Video | undefined {
     const video = this.videos.get(id);
     if (!video) return undefined;
     const updated: Video = {
@@ -69,6 +69,7 @@ export class MemStorage implements IStorage {
       status,
       ...(transcript !== undefined ? { transcript } : {}),
       ...(errorMessage !== undefined ? { errorMessage } : {}),
+      ...(visualContext !== undefined ? { visualContext } : {}),
     };
     this.videos.set(id, updated);
     return updated;

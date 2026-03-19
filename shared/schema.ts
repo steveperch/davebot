@@ -8,6 +8,7 @@ export const videos = pgTable("videos", {
   loomUrl: text("loom_url").notNull(),
   loomId: text("loom_id").notNull(),
   transcript: text("transcript"),
+  visualContext: text("visual_context"),
   duration: integer("duration"),
   thumbnailUrl: text("thumbnail_url"),
   status: text("status").notNull().default("pending"),
