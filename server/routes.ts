@@ -12,6 +12,9 @@ import OpenAI from "openai";
 const anthropic = new Anthropic();
 const execAsync = promisify(exec);
 
+// Use standard Anthropic model name that works with any API key
+const CLAUDE_MODEL = "claude-sonnet-4-20250514";
+
 // Processing queue with controlled concurrency (3 at a time to balance speed vs memory)
 const processingQueue: Array<{ videoId: number; loomId: string }> = [];
 const MAX_CONCURRENT = 3;
@@ -486,7 +489,7 @@ async function extractVisualContext(loomId: string): Promise<string> {
 
     // Send all frames to Claude Vision in one request for comprehensive analysis
     const response = await anthropic.messages.create({
-      model: "claude_sonnet_4_6",
+      model: CLAUDE_MODEL,
       max_tokens: 4096,
       messages: [
         {
@@ -817,7 +820,7 @@ export async function registerRoutes(
 
     try {
       const message = await anthropic.messages.create({
-        model: "claude_sonnet_4_6",
+        model: CLAUDE_MODEL,
         max_tokens: 1024,
         system:
           "You are DaveBot, a helpful assistant that answers questions based on a company's knowledge base which includes Loom video transcripts and supporting documents. Answer the question using ONLY the provided context. Always reference which video(s) or document(s) contain the relevant information. If you can't find the answer in the provided context, say so honestly. Format your response in clear, readable paragraphs.",
@@ -936,7 +939,7 @@ export async function registerRoutes(
         const uniqueDocIds = [...new Set(relevantChunks.filter((c) => c.document).map((c) => c.document!.id))];
 
         const message = await anthropic.messages.create({
-          model: "claude_sonnet_4_6",
+          model: CLAUDE_MODEL,
           max_tokens: 1024,
           system:
             "You are DaveBot, a helpful assistant that answers questions based on Loom video transcripts and supporting documents. Answer concisely using ONLY the provided context. Reference which videos or documents contain the information.",
@@ -1096,7 +1099,7 @@ export async function registerRoutes(
 
             try {
               const message = await anthropic.messages.create({
-                model: "claude_sonnet_4_6",
+                model: CLAUDE_MODEL,
                 max_tokens: 1024,
                 system: "You are DaveBot, a helpful assistant that answers questions based on Loom video transcripts and supporting documents. Answer concisely.",
                 messages: [{ role: "user", content: `Context:\n\n${context}\n\nQuestion: ${question}` }],
