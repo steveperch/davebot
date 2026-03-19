@@ -46,9 +46,24 @@ async function processOne(videoId: number, loomId: string) {
   }
 }
 
+// Format seconds into human-readable timestamp (e.g. 90 -> "1:30", 3661 -> "1:01:01")
+function formatTimestamp(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
 function extractLoomId(url: string): string | null {
   const match = url.match(/loom\.com\/(?:share|embed)\/([a-f0-9]+)/i);
   return match ? match[1] : null;
+}
+
+// Timed phrase from Loom transcript: { text, ts (seconds) }
+interface TimedPhrase {
+  text: string;
+  ts: number; // start time in seconds
 }
 
 function chunkText(text: string, chunkSize = 500): string[] {
@@ -65,18 +80,64 @@ function chunkText(text: string, chunkSize = 500): string[] {
   return chunks;
 }
 
-async function processTranscriptChunks(videoId: number, transcript: string) {
+// Chunk timed phrases into groups of ~500 words, preserving the start timestamp of each chunk
+function chunkTimedPhrases(phrases: TimedPhrase[], chunkSize = 500): Array<{ text: string; startTime: number }> {
+  const chunks: Array<{ text: string; startTime: number }> = [];
+  let currentWords: string[] = [];
+  let currentStartTime = 0;
+
+  for (const phrase of phrases) {
+    const words = phrase.text.split(/\s+/).filter(Boolean);
+    if (currentWords.length === 0) {
+      currentStartTime = phrase.ts;
+    }
+    currentWords.push(...words);
+
+    if (currentWords.length >= chunkSize) {
+      chunks.push({ text: currentWords.join(" "), startTime: Math.floor(currentStartTime) });
+      // Keep overlap from the end
+      const overlapWords = currentWords.slice(-50);
+      currentWords = overlapWords;
+      currentStartTime = phrase.ts; // next chunk starts at this phrase's time
+    }
+  }
+
+  if (currentWords.length > 0) {
+    chunks.push({ text: currentWords.join(" "), startTime: Math.floor(currentStartTime) });
+  }
+
+  return chunks;
+}
+
+async function processTranscriptChunks(videoId: number, transcript: string, timedPhrases?: TimedPhrase[]) {
   storage.deleteChunksByVideoId(videoId);
-  const textChunks = chunkText(transcript);
-  for (let i = 0; i < textChunks.length; i++) {
-    storage.addChunk({
-      videoId,
-      documentId: null,
-      content: textChunks[i],
-      startTime: null,
-      chunkIndex: i,
-      sourceType: "video",
-    });
+
+  if (timedPhrases && timedPhrases.length > 0) {
+    // Use timed chunking — preserves start timestamps for each chunk
+    const timedChunks = chunkTimedPhrases(timedPhrases);
+    for (let i = 0; i < timedChunks.length; i++) {
+      storage.addChunk({
+        videoId,
+        documentId: null,
+        content: timedChunks[i].text,
+        startTime: timedChunks[i].startTime,
+        chunkIndex: i,
+        sourceType: "video",
+      });
+    }
+  } else {
+    // Fallback: no timing data, chunk by word count
+    const textChunks = chunkText(transcript);
+    for (let i = 0; i < textChunks.length; i++) {
+      storage.addChunk({
+        videoId,
+        documentId: null,
+        content: textChunks[i],
+        startTime: null,
+        chunkIndex: i,
+        sourceType: "video",
+      });
+    }
   }
 }
 
@@ -115,6 +176,7 @@ async function fetchTranscript(videoId: number, loomId: string) {
     const html = await resp.text();
 
     let transcript: string | null = null;
+    let timedPhrases: TimedPhrase[] = []; // Preserve timing data for timestamp deep-links
     let title: string | null = null;
     let thumbnailUrl: string | null = null;
 
@@ -159,12 +221,16 @@ async function fetchTranscript(videoId: number, loomId: string) {
                 });
                 if (transcriptResp.ok) {
                   const transcriptData = await transcriptResp.json();
-                  // Loom transcript JSON has { phrases: [{ value: "text" }, ...] }
+                  // Loom transcript JSON has { phrases: [{ value: "text", ts: seconds }, ...] }
                   if (transcriptData?.phrases && Array.isArray(transcriptData.phrases)) {
                     transcript = transcriptData.phrases
                       .map((p: any) => p.value || "")
                       .filter((t: string) => t.trim())
                       .join(" ");
+                    // Capture timed phrases for timestamp deep-linking
+                    timedPhrases = transcriptData.phrases
+                      .filter((p: any) => p.value && p.value.trim())
+                      .map((p: any) => ({ text: p.value.trim(), ts: typeof p.ts === "number" ? p.ts : 0 }));
                   }
                 }
               } catch {
@@ -263,7 +329,7 @@ async function fetchTranscript(videoId: number, loomId: string) {
     const fullContext = buildFullContext(transcript, visualContext);
 
     if (fullContext && fullContext.length > 20) {
-      await processTranscriptChunks(videoId, fullContext);
+      await processTranscriptChunks(videoId, fullContext, timedPhrases.length > 0 ? timedPhrases : undefined);
       storage.updateVideoStatus(videoId, "ready", transcript || "", undefined, visualContext || undefined);
       console.log(`[Done] Video ${loomId}: transcript=${(transcript || "").length}ch, visual=${(visualContext || "").length}ch, combined=${fullContext.length}ch`);
     } else {
@@ -803,10 +869,12 @@ export async function registerRoutes(
       return res.json(convo);
     }
 
-    // Build context from both videos and documents
+    // Build context from both videos and documents, including timestamps
     const contextParts = relevantChunks.map((c) => {
       if (c.video) {
-        return `[Video: "${c.video.title}" (${c.video.loomUrl})]\n${c.content}`;
+        const timeStr = c.startTime ? ` [starts at ${formatTimestamp(c.startTime)}]` : "";
+        const tsUrl = c.startTime ? `${c.video.loomUrl}?t=${c.startTime}s` : c.video.loomUrl;
+        return `[Video: "${c.video.title}"${timeStr} (${tsUrl})]\n${c.content}`;
       } else if (c.document) {
         const urlPart = c.document.sourceUrl ? ` (${c.document.sourceUrl})` : "";
         return `[Document: "${c.document.title}"${urlPart}]\n${c.content}`;
@@ -818,12 +886,22 @@ export async function registerRoutes(
     const uniqueVideoIds = [...new Set(relevantChunks.filter((c) => c.video).map((c) => c.video!.id))];
     const uniqueDocIds = [...new Set(relevantChunks.filter((c) => c.document).map((c) => c.document!.id))];
 
+    // Build source video list with best timestamp per video
+    const videoTimestamps = new Map<number, number>();
+    for (const c of relevantChunks) {
+      if (c.video && c.startTime != null) {
+        if (!videoTimestamps.has(c.video.id)) {
+          videoTimestamps.set(c.video.id, c.startTime);
+        }
+      }
+    }
+
     try {
       const message = await anthropic.messages.create({
         model: CLAUDE_MODEL,
         max_tokens: 1024,
         system:
-          "You are DaveBot, a helpful assistant that answers questions based on a company's knowledge base which includes Loom video transcripts and supporting documents. Answer the question using ONLY the provided context. Always reference which video(s) or document(s) contain the relevant information. If you can't find the answer in the provided context, say so honestly. Format your response in clear, readable paragraphs.",
+          `You are DaveBot, a helpful assistant that answers questions based on a company's knowledge base which includes Loom video transcripts and supporting documents. Answer the question using ONLY the provided context. Always reference which video(s) or document(s) contain the relevant information. When a video context includes a timestamp like [starts at 2:30], mention that timestamp so the user knows where to look in the video. If you can't find the answer in the provided context, say so honestly. Format your response in clear, readable paragraphs.`,
         messages: [
           {
             role: "user",
@@ -835,7 +913,18 @@ export async function registerRoutes(
       const answerText =
         message.content[0].type === "text" ? message.content[0].text : "Unable to generate answer.";
 
-      const sourceVideos = uniqueVideoIds.map((vid) => storage.getVideo(vid)).filter(Boolean);
+      // Attach timestamped URLs to source videos
+      const sourceVideos = uniqueVideoIds.map((vid) => {
+        const v = storage.getVideo(vid);
+        if (!v) return null;
+        const ts = videoTimestamps.get(vid);
+        return {
+          ...v,
+          timestampUrl: ts ? `${v.loomUrl}?t=${ts}s` : v.loomUrl,
+          timestampSeconds: ts || null,
+          timestampFormatted: ts ? formatTimestamp(ts) : null,
+        };
+      }).filter(Boolean);
       const sourceDocs = uniqueDocIds.map((did) => storage.getDocument(did)).filter(Boolean);
 
       const convo = storage.addConversation({
@@ -930,7 +1019,11 @@ export async function registerRoutes(
 
       if (relevantChunks.length > 0) {
         const contextParts = relevantChunks.map((c) => {
-          if (c.video) return `[Video: "${c.video.title}"]\n${c.content}`;
+          if (c.video) {
+            const timeStr = c.startTime ? ` [starts at ${formatTimestamp(c.startTime)}]` : "";
+            const tsUrl = c.startTime ? `${c.video.loomUrl}?t=${c.startTime}s` : c.video.loomUrl;
+            return `[Video: "${c.video.title}"${timeStr} (${tsUrl})]\n${c.content}`;
+          }
           if (c.document) return `[Document: "${c.document.title}"]\n${c.content}`;
           return c.content;
         });
@@ -938,18 +1031,31 @@ export async function registerRoutes(
         const uniqueVideoIds = [...new Set(relevantChunks.filter((c) => c.video).map((c) => c.video!.id))];
         const uniqueDocIds = [...new Set(relevantChunks.filter((c) => c.document).map((c) => c.document!.id))];
 
+        // Best timestamp per video for Slack links
+        const slackVideoTimestamps = new Map<number, number>();
+        for (const c of relevantChunks) {
+          if (c.video && c.startTime != null && !slackVideoTimestamps.has(c.video.id)) {
+            slackVideoTimestamps.set(c.video.id, c.startTime);
+          }
+        }
+
         const message = await anthropic.messages.create({
           model: CLAUDE_MODEL,
           max_tokens: 1024,
           system:
-            "You are DaveBot, a helpful assistant that answers questions based on Loom video transcripts and supporting documents. Answer concisely using ONLY the provided context. Reference which videos or documents contain the information.",
+            "You are DaveBot, a helpful assistant that answers questions based on Loom video transcripts and supporting documents. Answer concisely using ONLY the provided context. Reference which videos or documents contain the information. When a timestamp is available, mention it so the user knows where to look in the video.",
           messages: [
             { role: "user", content: `Context:\n\n${context}\n\nQuestion: ${questionText}` },
           ],
         });
 
         answerText = message.content[0].type === "text" ? message.content[0].text : answerText;
-        sourceVideos = uniqueVideoIds.map((id) => storage.getVideo(id)).filter(Boolean);
+        sourceVideos = uniqueVideoIds.map((id) => {
+          const v = storage.getVideo(id);
+          if (!v) return null;
+          const ts = slackVideoTimestamps.get(id);
+          return { ...v, timestampSeconds: ts || null };
+        }).filter(Boolean);
         sourceDocs = uniqueDocIds.map((id) => storage.getDocument(id)).filter(Boolean);
 
         storage.addConversation({
@@ -972,7 +1078,11 @@ export async function registerRoutes(
         ];
         const sourceLinks: string[] = [];
         if (sourceVideos.length > 0) {
-          sourceLinks.push(...sourceVideos.map((v: any) => `• <${v.loomUrl}|🎥 ${v.title}>`));
+          sourceLinks.push(...sourceVideos.map((v: any) => {
+            const url = v.timestampSeconds ? `${v.loomUrl}?t=${v.timestampSeconds}s` : v.loomUrl;
+            const timeLabel = v.timestampSeconds ? ` (at ${formatTimestamp(v.timestampSeconds)})` : "";
+            return `• <${url}|🎥 ${v.title}${timeLabel}>`;
+          }));
         }
         if (sourceDocs.length > 0) {
           sourceDocs.forEach((d: any) => {

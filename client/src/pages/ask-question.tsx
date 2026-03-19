@@ -17,8 +17,14 @@ import {
 } from "lucide-react";
 import type { Conversation, Video, Document } from "@shared/schema";
 
+interface SourceVideo extends Video {
+  timestampUrl?: string;
+  timestampSeconds?: number | null;
+  timestampFormatted?: string | null;
+}
+
 interface AskResponse extends Conversation {
-  sourceVideos?: Video[];
+  sourceVideos?: SourceVideo[];
   sourceDocuments?: Document[];
 }
 
@@ -132,7 +138,7 @@ export default function AskQuestion() {
                     {currentAnswer.sourceVideos?.map((v) => (
                       <a
                         key={`v-${v.id}`}
-                        href={v.loomUrl}
+                        href={v.timestampUrl || v.loomUrl}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="inline-flex items-center gap-1.5 text-xs bg-muted/60 hover:bg-muted px-2.5 py-1.5 rounded-md transition-colors"
@@ -141,6 +147,11 @@ export default function AskQuestion() {
                         <ExternalLink className="h-3 w-3" />
                         <span className="text-muted-foreground">🎥</span>
                         {v.title}
+                        {v.timestampFormatted && (
+                          <Badge variant="outline" className="text-[10px] px-1.5 py-0 h-4 ml-1 font-mono">
+                            {v.timestampFormatted}
+                          </Badge>
+                        )}
                       </a>
                     ))}
                     {currentAnswer.sourceDocuments?.map((d) => (
