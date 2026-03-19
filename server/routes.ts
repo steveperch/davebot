@@ -12,32 +12,35 @@ import OpenAI from "openai";
 const anthropic = new Anthropic();
 const execAsync = promisify(exec);
 
-// Simple sequential processing queue to prevent OOM from parallel video processing
+// Processing queue with controlled concurrency (3 at a time to balance speed vs memory)
 const processingQueue: Array<{ videoId: number; loomId: string }> = [];
-let isProcessing = false;
+const MAX_CONCURRENT = 3;
+let activeWorkers = 0;
 
 async function enqueueVideoProcessing(videoId: number, loomId: string) {
   processingQueue.push({ videoId, loomId });
-  if (!isProcessing) {
-    processNextInQueue();
+  drainQueue();
+}
+
+function drainQueue() {
+  while (activeWorkers < MAX_CONCURRENT && processingQueue.length > 0) {
+    const { videoId, loomId } = processingQueue.shift()!;
+    activeWorkers++;
+    processOne(videoId, loomId).finally(() => {
+      activeWorkers--;
+      // Small delay then try to fill the slot
+      setTimeout(() => drainQueue(), 500);
+    });
   }
 }
 
-async function processNextInQueue() {
-  if (processingQueue.length === 0) {
-    isProcessing = false;
-    return;
-  }
-  isProcessing = true;
-  const { videoId, loomId } = processingQueue.shift()!;
+async function processOne(videoId: number, loomId: string) {
   try {
     await fetchTranscript(videoId, loomId);
   } catch (err: any) {
     console.error(`[Queue] Error processing video ${loomId}:`, err.message);
     storage.updateVideoStatus(videoId, "error", undefined, err.message || "Processing failed");
   }
-  // Process next item after a brief cooldown
-  setTimeout(() => processNextInQueue(), 1000);
 }
 
 function extractLoomId(url: string): string | null {
@@ -539,6 +542,17 @@ export async function registerRoutes(
   httpServer: Server,
   app: Express
 ): Promise<Server> {
+
+  // On startup, re-queue any videos stuck in pending/processing state
+  const staleVideos = storage.getAllVideos().filter(
+    (v) => v.status === "pending" || v.status === "processing"
+  );
+  if (staleVideos.length > 0) {
+    console.log(`[Startup] Re-queuing ${staleVideos.length} unfinished videos...`);
+    for (const v of staleVideos) {
+      enqueueVideoProcessing(v.id, v.loomId);
+    }
+  }
 
   // ===== Video Management =====
 
