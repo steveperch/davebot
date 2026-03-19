@@ -883,6 +883,25 @@ export async function registerRoutes(
     });
   });
 
+  // Diagnostic endpoint to verify volume/storage setup
+  app.get("/api/debug-storage", async (_req, res) => {
+    const { existsSync, statSync } = require("fs");
+    const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH;
+    const dataDir = process.env.DATA_DIR;
+    const dbPath = volumePath ? require("path").join(volumePath, "davebot.db") : (dataDir ? require("path").join(dataDir, "davebot.db") : require("path").join(process.cwd(), "data", "davebot.db"));
+    const dbExists = existsSync(dbPath);
+    let dbSize = 0;
+    try { dbSize = statSync(dbPath).size; } catch {}
+    res.json({
+      RAILWAY_VOLUME_MOUNT_PATH: volumePath || "(not set)",
+      DATA_DIR: dataDir || "(not set)",
+      resolvedDbPath: dbPath,
+      dbExists,
+      dbSizeBytes: dbSize,
+      cwd: process.cwd(),
+    });
+  });
+
   // ===== Slack Integration =====
 
   app.post("/api/slack/command", async (req, res) => {
