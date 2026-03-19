@@ -73,46 +73,88 @@ async function fetchTranscript(videoId: number, loomId: string) {
 
     const html = await resp.text();
 
-    // Try to extract transcript from __NEXT_DATA__
-    const nextDataMatch = html.match(/<script[^>]*id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
     let transcript: string | null = null;
     let title: string | null = null;
     let thumbnailUrl: string | null = null;
 
-    if (nextDataMatch) {
-      try {
-        const data = JSON.parse(nextDataMatch[1]);
-        const props = data?.props?.pageProps;
-        if (props?.transcript) {
-          transcript = props.transcript;
-        }
-        if (props?.name || props?.title) {
-          title = props.name || props.title;
-        }
-      } catch {
-        // JSON parse failed
-      }
+    // Extract thumbnail
+    const ogImageMatch = html.match(/<meta[^>]*property="og:image"[^>]*content="([^"]+)"/);
+    if (ogImageMatch) {
+      thumbnailUrl = ogImageMatch[1];
     }
 
-    // Try Apollo state
-    if (!transcript) {
-      const apolloMatch = html.match(/window\.__APOLLO_STATE__\s*=\s*({[\s\S]*?});?\s*<\/script>/);
-      if (apolloMatch) {
-        try {
-          const apollo = JSON.parse(apolloMatch[1]);
+    // Extract title
+    const titleMatch = html.match(/<meta[^>]*property="og:title"[^>]*content="([^"]+)"/);
+    if (titleMatch) title = titleMatch[1];
+    if (!title) {
+      const titleTagMatch = html.match(/<title>([^<]+)<\/title>/);
+      if (titleTagMatch) title = titleTagMatch[1].replace(/ \| Loom$/, "").trim();
+    }
+
+    // Strategy 1: Extract signed transcript URL from Apollo state and fetch transcript JSON
+    const apolloMatch = html.match(/window\.__APOLLO_STATE__\s*=\s*({[\s\S]*?});?\s*<\/script>/);
+    if (apolloMatch) {
+      try {
+        const apollo = JSON.parse(apolloMatch[1]);
+        // Look for the signed source_url for transcript in VideoTranscriptDetails
+        for (const key of Object.keys(apollo)) {
+          const val = apollo[key];
+          if (val?.source_url && typeof val.source_url === "string" && val.source_url.includes("transcription")) {
+            try {
+              const transcriptResp = await fetch(val.source_url, {
+                headers: { "User-Agent": "Mozilla/5.0" },
+              });
+              if (transcriptResp.ok) {
+                const transcriptData = await transcriptResp.json();
+                // Loom transcript JSON has { phrases: [{ value: "text" }, ...] }
+                if (transcriptData?.phrases && Array.isArray(transcriptData.phrases)) {
+                  transcript = transcriptData.phrases
+                    .map((p: any) => p.value || "")
+                    .filter((t: string) => t.trim())
+                    .join(" ");
+                }
+              }
+            } catch {
+              // Failed to fetch transcript JSON, will try fallbacks
+            }
+            break;
+          }
+        }
+
+        // Fallback: look for transcript_text directly in Apollo state
+        if (!transcript) {
           for (const key of Object.keys(apollo)) {
             if (apollo[key]?.transcript_text) {
               transcript = apollo[key].transcript_text;
               break;
             }
           }
+        }
+      } catch {
+        // Apollo parse failed
+      }
+    }
+
+    // Strategy 2: Try __NEXT_DATA__ (older Loom pages)
+    if (!transcript) {
+      const nextDataMatch = html.match(/<script[^>]*id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+      if (nextDataMatch) {
+        try {
+          const data = JSON.parse(nextDataMatch[1]);
+          const props = data?.props?.pageProps;
+          if (props?.transcript) {
+            transcript = props.transcript;
+          }
+          if (!title && (props?.name || props?.title)) {
+            title = props.name || props.title;
+          }
         } catch {
-          // parse failed
+          // JSON parse failed
         }
       }
     }
 
-    // Try generic JSON patterns in the page
+    // Strategy 3: Try generic JSON patterns in the HTML
     if (!transcript) {
       const transcriptPatterns = [
         /"transcript(?:_text)?"\s*:\s*"((?:[^"\\]|\\.)*)"/,
@@ -127,22 +169,7 @@ async function fetchTranscript(videoId: number, loomId: string) {
       }
     }
 
-    // Extract thumbnail
-    const ogImageMatch = html.match(/<meta[^>]*property="og:image"[^>]*content="([^"]+)"/);
-    if (ogImageMatch) {
-      thumbnailUrl = ogImageMatch[1];
-    }
-
-    // Extract title from page
-    if (!title) {
-      const titleMatch = html.match(/<meta[^>]*property="og:title"[^>]*content="([^"]+)"/);
-      if (titleMatch) title = titleMatch[1];
-    }
-    if (!title) {
-      const titleTagMatch = html.match(/<title>([^<]+)<\/title>/);
-      if (titleTagMatch) title = titleTagMatch[1].replace(/ \| Loom$/, "").trim();
-    }
-
+    // Update video metadata
     const video = storage.getVideo(videoId);
     if (video && title && video.title === `Loom Video ${loomId.slice(0, 8)}`) {
       const updated = storage.updateVideoStatus(videoId, video.status);
