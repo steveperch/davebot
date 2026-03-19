@@ -12,6 +12,34 @@ import OpenAI from "openai";
 const anthropic = new Anthropic();
 const execAsync = promisify(exec);
 
+// Simple sequential processing queue to prevent OOM from parallel video processing
+const processingQueue: Array<{ videoId: number; loomId: string }> = [];
+let isProcessing = false;
+
+async function enqueueVideoProcessing(videoId: number, loomId: string) {
+  processingQueue.push({ videoId, loomId });
+  if (!isProcessing) {
+    processNextInQueue();
+  }
+}
+
+async function processNextInQueue() {
+  if (processingQueue.length === 0) {
+    isProcessing = false;
+    return;
+  }
+  isProcessing = true;
+  const { videoId, loomId } = processingQueue.shift()!;
+  try {
+    await fetchTranscript(videoId, loomId);
+  } catch (err: any) {
+    console.error(`[Queue] Error processing video ${loomId}:`, err.message);
+    storage.updateVideoStatus(videoId, "error", undefined, err.message || "Processing failed");
+  }
+  // Process next item after a brief cooldown
+  setTimeout(() => processNextInQueue(), 1000);
+}
+
 function extractLoomId(url: string): string | null {
   const match = url.match(/loom\.com\/(?:share|embed)\/([a-f0-9]+)/i);
   return match ? match[1] : null;
@@ -189,16 +217,13 @@ async function fetchTranscript(videoId: number, loomId: string) {
       }
     }
 
-    // Update video metadata
+    // Update video metadata (title + thumbnail) properly via DB
     const video = storage.getVideo(videoId);
-    if (video && title && video.title === `Loom Video ${loomId.slice(0, 8)}`) {
-      const updated = storage.updateVideoStatus(videoId, video.status);
-      if (updated) {
-        (updated as any).title = title;
+    if (video) {
+      const newTitle = (title && video.title === `Loom Video ${loomId.slice(0, 8)}`) ? title : undefined;
+      if (newTitle || thumbnailUrl) {
+        storage.updateVideoMetadata(videoId, newTitle, thumbnailUrl || undefined);
       }
-    }
-    if (video && thumbnailUrl) {
-      (video as any).thumbnailUrl = thumbnailUrl;
     }
 
     // If no Loom transcript, try audio fallback
@@ -546,7 +571,7 @@ export async function registerRoutes(
       addedAt: new Date().toISOString(),
     });
 
-    fetchTranscript(video.id, loomId).catch(() => {});
+    enqueueVideoProcessing(video.id, loomId);
     res.status(201).json(video);
   });
 
@@ -589,7 +614,7 @@ export async function registerRoutes(
         addedAt: new Date().toISOString(),
       });
 
-      fetchTranscript(video.id, loomId).catch(() => {});
+      enqueueVideoProcessing(video.id, loomId);
       results.push({ url, success: true, video });
     }
 
@@ -618,7 +643,7 @@ export async function registerRoutes(
       return res.status(404).json({ message: "Video not found" });
     }
     storage.updateVideoStatus(id, "pending", undefined, undefined);
-    fetchTranscript(id, video.loomId).catch(() => {});
+    enqueueVideoProcessing(id, video.loomId);
     res.json({ success: true, message: "Re-fetching transcript" });
   });
 
@@ -837,6 +862,8 @@ export async function registerRoutes(
     res.json({
       totalVideos: videos.length,
       readyVideos: videos.filter((v) => v.status === "ready").length,
+      processingVideos: videos.filter((v) => v.status === "processing" || v.status === "pending").length,
+      queueLength: processingQueue.length,
       totalDocuments: documents.length,
       totalQuestions: conversations.length,
     });
@@ -968,7 +995,7 @@ export async function registerRoutes(
       addedAt: new Date().toISOString(),
     });
 
-    fetchTranscript(video.id, loomId).catch(() => {});
+    enqueueVideoProcessing(video.id, loomId);
     return { added: true, loomId };
   }
 
