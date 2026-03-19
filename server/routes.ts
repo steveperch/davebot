@@ -2,8 +2,15 @@ import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
 import Anthropic from "@anthropic-ai/sdk";
+import { exec } from "child_process";
+import { promisify } from "util";
+import { writeFile, readFile, unlink, mkdtemp } from "fs/promises";
+import { tmpdir } from "os";
+import { join } from "path";
+import OpenAI from "openai";
 
 const anthropic = new Anthropic();
+const execAsync = promisify(exec);
 
 function extractLoomId(url: string): string | null {
   const match = url.match(/loom\.com\/(?:share|embed)\/([a-f0-9]+)/i);
@@ -197,14 +204,147 @@ async function fetchTranscript(videoId: number, loomId: string) {
     if (transcript && transcript.length > 50) {
       await processTranscriptChunks(videoId, transcript);
       storage.updateVideoStatus(videoId, "ready", transcript);
-    } else {
-      const errorMsg = loomTranscriptionFailed
-        ? "Loom has no transcript for this video (transcription failed on Loom's side). Paste the transcript manually."
-        : "Could not auto-fetch transcript. Please paste the transcript manually.";
-      storage.updateVideoStatus(videoId, "error", undefined, errorMsg);
+    } else if (loomTranscriptionFailed || !transcript) {
+      // Fallback: download audio and transcribe with Whisper
+      console.log(`[Fallback] Attempting audio transcription for video ${loomId}...`);
+      storage.updateVideoStatus(videoId, "processing", undefined, "Loom transcript unavailable. Downloading audio for AI transcription...");
+      try {
+        const fallbackTranscript = await downloadAndTranscribe(loomId);
+        if (fallbackTranscript && fallbackTranscript.length > 5) {
+          await processTranscriptChunks(videoId, fallbackTranscript);
+          storage.updateVideoStatus(videoId, "ready", fallbackTranscript);
+          console.log(`[Fallback] Successfully transcribed video ${loomId} (${fallbackTranscript.length} chars)`);
+        } else {
+          storage.updateVideoStatus(videoId, "error", undefined, "Audio transcription returned insufficient text. The video may have no speech. Paste the transcript manually.");
+        }
+      } catch (fallbackErr: any) {
+        console.error(`[Fallback] Transcription failed for ${loomId}:`, fallbackErr.message);
+        const errorMsg = loomTranscriptionFailed
+          ? `Loom has no transcript for this video. Auto-transcription also failed: ${fallbackErr.message}. Paste the transcript manually.`
+          : `Could not auto-fetch transcript. Auto-transcription failed: ${fallbackErr.message}. Paste the transcript manually.`;
+        storage.updateVideoStatus(videoId, "error", undefined, errorMsg);
+      }
     }
   } catch (err: any) {
     storage.updateVideoStatus(videoId, "error", undefined, err.message || "Failed to fetch transcript");
+  }
+}
+
+/**
+ * Downloads audio from a Loom video and transcribes it using OpenAI Whisper.
+ * Uses Loom's raw-url API to get HLS stream, yt-dlp to download, and Whisper for transcription.
+ */
+async function downloadAndTranscribe(loomId: string): Promise<string> {
+  const openaiKey = process.env.OPENAI_API_KEY;
+
+  // Create temp directory for audio files
+  const tempDir = await mkdtemp(join(tmpdir(), "davebot-"));
+  const audioPath = join(tempDir, `${loomId}.mp3`);
+
+  try {
+    // Try yt-dlp first (most reliable)
+    let downloadSuccess = false;
+    try {
+      const loomUrl = `https://www.loom.com/share/${loomId}`;
+      await execAsync(
+        `yt-dlp -x --audio-format mp3 --audio-quality 5 -o "${audioPath.replace('.mp3', '.%(ext)s')}" "${loomUrl}"`,
+        { timeout: 120000 }
+      );
+      downloadSuccess = true;
+      console.log(`[Fallback] Downloaded audio via yt-dlp for ${loomId}`);
+    } catch (ytdlpErr: any) {
+      console.log(`[Fallback] yt-dlp not available or failed: ${ytdlpErr.message}. Trying direct download...`);
+    }
+
+    // Fallback: use Loom's raw-url API + ffmpeg
+    if (!downloadSuccess) {
+      const rawUrlResp = await fetch(
+        `https://www.loom.com/api/campaigns/sessions/${loomId}/raw-url`,
+        {
+          method: "POST",
+          headers: { "Accept": "application/json", "Content-Type": "application/json" },
+          body: JSON.stringify({
+            anonID: crypto.randomUUID(),
+            deviceID: null,
+            force_original: false,
+            password: null,
+          }),
+        }
+      );
+
+      if (!rawUrlResp.ok) {
+        throw new Error(`Loom raw-url API returned ${rawUrlResp.status}`);
+      }
+
+      const rawUrlData = await rawUrlResp.json() as any;
+      const hlsUrl = rawUrlData?.url;
+      if (!hlsUrl) {
+        throw new Error("No video URL returned from Loom API");
+      }
+
+      // Use ffmpeg to download HLS stream and extract audio
+      const mergedUrl = hlsUrl.replace('-split.m3u8', '.m3u8');
+      await execAsync(
+        `ffmpeg -i "${mergedUrl}" -vn -acodec libmp3lame -q:a 5 -y "${audioPath}"`,
+        { timeout: 120000 }
+      );
+      console.log(`[Fallback] Downloaded audio via ffmpeg for ${loomId}`);
+    }
+
+    // Read the audio file
+    const audioBuffer = await readFile(audioPath);
+    if (audioBuffer.length < 1000) {
+      throw new Error("Downloaded audio file is too small — video may have no audio track");
+    }
+
+    console.log(`[Fallback] Audio file size: ${(audioBuffer.length / 1024 / 1024).toFixed(1)}MB. Transcribing...`);
+
+    // Strategy 1: Try pplx transcription SDK via Python subprocess (available in sandbox)
+    try {
+      const scriptDir = (import.meta as any).dirname || __dirname;
+      const scriptPath = join(scriptDir, 'transcribe.py');
+
+      const { stdout } = await execAsync(
+        `python3 "${scriptPath}" "${audioPath}"`,
+        { timeout: 180000, maxBuffer: 10 * 1024 * 1024 }
+      );
+      const text = stdout.trim();
+      if (text && text.length > 0) {
+        console.log(`[Fallback] Transcribed via pplx SDK (${text.length} chars)`);
+        return text;
+      } else {
+        console.log(`[Fallback] pplx SDK returned empty transcript`);
+      }
+    } catch (pplxErr: any) {
+      const errDetail = pplxErr.stderr || pplxErr.message || String(pplxErr);
+      console.log(`[Fallback] pplx SDK failed: ${String(errDetail).slice(0, 200)}. Trying OpenAI Whisper...`);
+    }
+
+    // Strategy 2: OpenAI Whisper API
+    // OpenAI SDK auto-reads OPENAI_API_KEY and OPENAI_BASE_URL from env
+    if (!openaiKey && !process.env.OPENAI_BASE_URL) {
+      throw new Error("No transcription service available. Set OPENAI_API_KEY for Whisper transcription.");
+    }
+
+    const openai = new OpenAI();
+    const audioFile = new File([audioBuffer], `${loomId}.mp3`, { type: "audio/mpeg" });
+    const transcription = await openai.audio.transcriptions.create({
+      file: audioFile,
+      model: "whisper-1",
+      language: "en",
+    });
+
+    return transcription.text || "";
+  } finally {
+    // Clean up temp files
+    try {
+      await unlink(audioPath).catch(() => {});
+      // Also clean up any variant extension files yt-dlp may have created
+      const { exec: execSync } = await import("child_process");
+      execSync(`rm -rf "${tempDir}"`, () => {});
+    } catch {
+      // Ignore cleanup errors
+    }
   }
 }
 
