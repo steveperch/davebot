@@ -92,32 +92,45 @@ async function fetchTranscript(videoId: number, loomId: string) {
     }
 
     // Strategy 1: Extract signed transcript URL from Apollo state and fetch transcript JSON
+    let loomTranscriptionFailed = false;
     const apolloMatch = html.match(/window\.__APOLLO_STATE__\s*=\s*({[\s\S]*?});?\s*<\/script>/);
     if (apolloMatch) {
       try {
         const apollo = JSON.parse(apolloMatch[1]);
-        // Look for the signed source_url for transcript in VideoTranscriptDetails
+
+        // Check if Loom's own transcription failed
         for (const key of Object.keys(apollo)) {
           const val = apollo[key];
-          if (val?.source_url && typeof val.source_url === "string" && val.source_url.includes("transcription")) {
-            try {
-              const transcriptResp = await fetch(val.source_url, {
-                headers: { "User-Agent": "Mozilla/5.0" },
-              });
-              if (transcriptResp.ok) {
-                const transcriptData = await transcriptResp.json();
-                // Loom transcript JSON has { phrases: [{ value: "text" }, ...] }
-                if (transcriptData?.phrases && Array.isArray(transcriptData.phrases)) {
-                  transcript = transcriptData.phrases
-                    .map((p: any) => p.value || "")
-                    .filter((t: string) => t.trim())
-                    .join(" ");
-                }
-              }
-            } catch {
-              // Failed to fetch transcript JSON, will try fallbacks
-            }
+          if (val?.transcription_status === "failed") {
+            loomTranscriptionFailed = true;
             break;
+          }
+        }
+
+        // Look for the signed source_url for transcript in VideoTranscriptDetails
+        if (!loomTranscriptionFailed) {
+          for (const key of Object.keys(apollo)) {
+            const val = apollo[key];
+            if (val?.source_url && typeof val.source_url === "string" && val.source_url.includes("transcription")) {
+              try {
+                const transcriptResp = await fetch(val.source_url, {
+                  headers: { "User-Agent": "Mozilla/5.0" },
+                });
+                if (transcriptResp.ok) {
+                  const transcriptData = await transcriptResp.json();
+                  // Loom transcript JSON has { phrases: [{ value: "text" }, ...] }
+                  if (transcriptData?.phrases && Array.isArray(transcriptData.phrases)) {
+                    transcript = transcriptData.phrases
+                      .map((p: any) => p.value || "")
+                      .filter((t: string) => t.trim())
+                      .join(" ");
+                  }
+                }
+              } catch {
+                // Failed to fetch transcript JSON, will try fallbacks
+              }
+              break;
+            }
           }
         }
 
@@ -185,12 +198,10 @@ async function fetchTranscript(videoId: number, loomId: string) {
       await processTranscriptChunks(videoId, transcript);
       storage.updateVideoStatus(videoId, "ready", transcript);
     } else {
-      storage.updateVideoStatus(
-        videoId,
-        "error",
-        undefined,
-        "Could not auto-fetch transcript. Please paste the transcript manually."
-      );
+      const errorMsg = loomTranscriptionFailed
+        ? "Loom has no transcript for this video (transcription failed on Loom's side). Paste the transcript manually."
+        : "Could not auto-fetch transcript. Please paste the transcript manually.";
+      storage.updateVideoStatus(videoId, "error", undefined, errorMsg);
     }
   } catch (err: any) {
     storage.updateVideoStatus(videoId, "error", undefined, err.message || "Failed to fetch transcript");
